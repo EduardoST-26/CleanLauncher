@@ -8,6 +8,7 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.MediaPlayer;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.util.Log;
@@ -36,18 +37,24 @@ public class GreeterService extends Service {
     private final Handler handler = new Handler();
     private final List<Integer> queue = new ArrayList<>();
     private final RadioClient radio = new RadioClient();
+    private final SoundClient sound = new SoundClient();
     private MediaPlayer player;
     private boolean waitingForPhone;
+    private boolean btPlaying;
 
     @Override
     public void onCreate() {
         super.onCreate();
         radio.bind(this);
+        sound.bind(this, () -> handler.post(() -> EqAuto.apply(this, sound)));
         IntentFilter f = new IntentFilter();
+        f.addAction("com.nwd.action.ACTION_CHANGE_SOURCE");      // auto EQ: radio vs music curve
+        f.addAction("com.nwd.action.ACTION_VOLUME_STATE_CHANGE"); // auto EQ: loudness
         f.addAction("com.nwd.action.ACTION_MCU_STATE_CHANGE"); // ACC off (3) / on (1)
         f.addAction("com.bt.ACTION_A2DP_ESTABLISHED");
         f.addAction("com.bt.ACTION_AVRCP_ESTABLISHED");
         f.addAction("com.bt.ACTION_BT_MUSIC_PLAY");
+        f.addAction("com.bt.ACTION_BT_MUSIC_PAUSE");
         f.addAction("com.simple.carlauncher.TEST_CAR_ON"); // adb test hook
         registerReceiver(events, f);
         // Right after boot, bring the last source back and greet. A plain restart of this app
@@ -67,6 +74,14 @@ public class GreeterService extends Service {
         @Override
         public void onReceive(Context c, Intent i) {
             String a = i.getAction();
+            if ("com.nwd.action.ACTION_CHANGE_SOURCE".equals(a)) {
+                handler.postDelayed(() -> EqAuto.apply(GreeterService.this, sound), 1500);
+                return;
+            }
+            if ("com.nwd.action.ACTION_VOLUME_STATE_CHANGE".equals(a)) {
+                handler.postDelayed(() -> EqAuto.applyLoudness(GreeterService.this, sound), 300);
+                return;
+            }
             if ("com.nwd.action.ACTION_MCU_STATE_CHANGE".equals(a)) {
                 int state = i.getByteExtra("extra_mcu_state", (byte) -1);
                 Log.d(TAG, "mcu_state=" + state);
@@ -74,14 +89,19 @@ public class GreeterService extends Service {
                 else if (state == 1) onCarOn();
             } else if ("com.simple.carlauncher.TEST_CAR_ON".equals(a)) {
                 onCarOn();
+            } else if ("com.bt.ACTION_BT_MUSIC_PAUSE".equals(a)) {
+                btPlaying = false;
             } else if ("com.bt.ACTION_BT_MUSIC_PLAY".equals(a)) {
-                // The phone started music: make Bluetooth the source so the radio stops
-                // instead of both playing at once.
+                // The phone *started* music (paused -> playing): make Bluetooth the source so the
+                // radio stops instead of both playing. The phone repeats PLAY while streaming, so
+                // react only to the transition, and never right after the user picked the radio.
                 waitingForPhone = false;
-                int src = android.provider.Settings.System.getInt(getContentResolver(), "mcu_current_source", 0);
-                if (src != SRC_BT) {
-                    Log.d(TAG, "BT music started while source=" + src + ", switching to Bluetooth");
-                    Ui.requestSource(GreeterService.this, Ui.SOURCE_BT_MUSIC);
+                boolean started = !btPlaying;
+                btPlaying = true;
+                long sinceRadio = android.os.SystemClock.elapsedRealtime() - Ui.userChoseRadioAt;
+                if (started && Ui.radioIsSource(GreeterService.this) && sinceRadio > 30_000) {
+                    Log.d(TAG, "BT music started over the radio, switching to Bluetooth");
+                    Ui.selectBluetooth(GreeterService.this);
                 }
             } else if (waitingForPhone) {
                 // Phone connected after ACC on: resume Bluetooth music.
@@ -112,14 +132,15 @@ public class GreeterService extends Service {
     }
 
     private void restoreAudio() {
+        if (!Profile.isNwd(this)) return; // NWD source handling only
         int src = prefs().getInt("last_source",
                 android.provider.Settings.System.getInt(getContentResolver(), "mcu_current_source", 0));
         Log.d(TAG, "restore audio source=" + src);
         if (NowPlaying.get(this).track(NowPlaying.Source.BT).playing) {
-            Ui.requestSource(this, Ui.SOURCE_BT_MUSIC); // phone already playing: keep Bluetooth
+            Ui.selectBluetooth(this); // phone already playing: keep Bluetooth
         } else if (src == SRC_RADIO) {
-            Ui.requestSource(this, Ui.SOURCE_RADIO);
-            handler.postDelayed(() -> radio.wakeTuner(this), 800);
+            Ui.selectRadio(this, radio);
+            Ui.userChoseRadioAt = 0; // automatic restore: a phone that starts playing may still take over
         } else if (src == SRC_BT) {
             if (NowPlaying.get(this).btClient.isPhoneConnected()) startBluetoothMusic();
             else waitingForPhone = true; // wait for the phone to connect
@@ -129,7 +150,7 @@ public class GreeterService extends Service {
     }
 
     private void startBluetoothMusic() {
-        Ui.requestSource(this, Ui.SOURCE_BT_MUSIC);
+        Ui.selectBluetooth(this);
         handler.postDelayed(() -> NowPlaying.get(this).btClient.playControl(BtClient.PLAY), 1500);
     }
 
@@ -144,9 +165,27 @@ public class GreeterService extends Service {
     }
 
     private final Runnable greet = () -> {
+        if (!Profile.voiceEnabled(this)) return;
         prefs().edit().putLong("last_greet", System.currentTimeMillis()).apply();
-        speak(buildMessage());
+        List<String> clips = buildMessage();
+        // Owner's build ships recorded clips; shared builds speak with the device's TTS engine.
+        if (getResources().getIdentifier("v_careful", "raw", getPackageName()) != 0) speak(clips);
+        else speakTts(Speech.text(this, clips));
     };
+
+    private android.speech.tts.TextToSpeech tts;
+
+    private void speakTts(String text) {
+        if (tts != null) tts.shutdown();
+        tts = new android.speech.tts.TextToSpeech(this, status -> {
+            if (status != android.speech.tts.TextToSpeech.SUCCESS) return;
+            java.util.Locale es = new java.util.Locale("es", "US");
+            if (tts.isLanguageAvailable(es) < 0) es = new java.util.Locale("es");
+            tts.setLanguage(es);
+            Bundle params = new Bundle();
+            tts.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, "greet");
+        });
+    }
 
     private List<String> buildMessage() {
         List<String> clips = new ArrayList<>();
@@ -171,7 +210,9 @@ public class GreeterService extends Service {
             else if (left <= Odometer.WARN_KM) clips.add("v_oil_soon");
         }
         clips.add("v_seatbelt");
-        if (day == Calendar.WEDNESDAY) clips.add("v_picoplaca"); // Quito: 6:00-9:30, 16:00-20:00
+        if (day == Calendar.WEDNESDAY && Profile.picoPlacaEnabled(this)) {
+            clips.add("v_picoplaca"); // Quito: 6:00-9:30, 16:00-20:00
+        }
         clips.add("v_careful");
         return clips;
     }
@@ -235,9 +276,11 @@ public class GreeterService extends Service {
 
     @Override
     public void onDestroy() {
+        if (tts != null) tts.shutdown();
         super.onDestroy();
         unregisterReceiver(events);
         radio.unbind(this);
+        sound.unbind(this);
         handler.removeCallbacksAndMessages(null);
         if (player != null) player.release();
     }
