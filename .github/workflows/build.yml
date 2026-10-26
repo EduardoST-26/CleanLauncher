@@ -21,10 +21,19 @@ jobs:
         with:
           packages: "platforms;android-33 build-tools;36.0.0"
 
+      # Fixed signing key from repo secrets, so each APK installs over the previous one.
+      # Without the secrets (e.g. PRs from other forks) build.sh falls back to a throwaway key.
       - name: Build
         env:
           BUILD_TOOLS: "36.0.0"
-        run: sh build.sh
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            export KEYSTORE="$RUNNER_TEMP/release.keystore" KEY_ALIAS=cleanlauncher
+          fi
+          sh build.sh
 
       - uses: actions/upload-artifact@v4
         with:
