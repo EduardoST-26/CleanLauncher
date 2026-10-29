@@ -34,9 +34,16 @@ jobs:
             export KEYSTORE="$RUNNER_TEMP/release.keystore" KEY_ALIAS=cleanlauncher
           fi
           sh build.sh
+          sh tools/diagnostico/build.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: CleanLauncher-${{ github.sha }}
           path: build/CleanLauncher.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Diagnostico-${{ github.sha }}
+          path: tools/diagnostico/build/Diagnostico.apk
           if-no-files-found: error
